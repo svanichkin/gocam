@@ -124,13 +124,16 @@ From here you can:
 
 ### Linux
 
-- Uses **V4L2** directly via syscalls.
-- Default device: `/dev/video0`.
+- Uses **V4L2** directly via syscalls, no cgo.
+- Finding the camera: every `/dev/video*` node is tried in numeric order; nodes that are not capture devices (video decoders/encoders such as the PinePhone's Cedrus at `/dev/video0`, metadata nodes) are skipped. Set `GOCAM_DEVICE=/dev/video2` to use one node only.
+- Pixel formats: YUV24, NV12, NV21, YUYV, UYVY, YVYU, VYUY, RGB24 and BGR24, chosen among the ones the driver lists, in this order. Single- and multi-planar capture nodes (one plane) are supported. The frame is cropped and scaled to CIF in one pass while it is converted.
+- Size: CIF (352×288) first, then the node's current size if the driver refuses to stream at CIF.
+- SoC cameras with a media controller (PinePhone, many ARM boards): if the node still does not stream, gocam does what `media-ctl` would: it links a sensor to the capture node, sets the same format on every pad along the pipeline and tries again at the sensor's size. The front camera is preferred (the PinePhone's GC2145); `GOCAM_SENSOR=ov5640` picks a sensor by name. The topology and every step are logged.
+  - Sensors that only output raw Bayer need an ISP (PinePhone Pro, many phones); gocam reports this instead of streaming.
 - Requirements:
   - A V4L2-compatible camera.
-  - Access to `/dev/video0` (e.g. user in the `video` group).
-- Notes:
-  - Implementation accepts several V4L2 pixel formats (YUV24, NV12, YUYV, RGB24) and always converts them into packed YCbCr444.
+  - Read/write access to `/dev/video*` (the `video` group), and for SoC cameras also to `/dev/media*` and `/dev/v4l-subdev*`.
+- A camera that works is opened exactly as before; the extra steps only run when the plain way fails.
 
 ### Windows
 
@@ -190,7 +193,7 @@ Common failure reasons:
 - No camera is available.
 - Insufficient permissions:
   - macOS: camera privacy settings.
-  - Linux: not in `video` group or no `/dev/video0`.
+  - Linux: not in the `video` group, or no capture node among `/dev/video*` (each node's reason is in the error).
   - Windows: camera disabled or blocked by privacy settings.
 - Platform API initialization issues (Media Foundation / AVFoundation / V4L2).
 

@@ -23,6 +23,15 @@ static int gFrameWidth;
 static int gFrameHeight;
 static int gFrameReady;
 static NSLock *gLock;
+// gFrameSem is signalled for every new frame, so the Go side waits for
+// frames instead of polling.
+static dispatch_semaphore_t gFrameSem;
+
+// signalFrame wakes the Go side after a frame was stored (outside gLock).
+static void signalFrame(void) {
+    dispatch_semaphore_t sem = gFrameSem;
+    if (sem) dispatch_semaphore_signal(sem);
+}
 
 static inline uint8_t clampByte(int v) {
     if (v < 0) return 0;
@@ -156,6 +165,7 @@ static inline uint8_t clampByte(int v) {
         }
 
         [gLock unlock];
+        signalFrame();
 
         CVPixelBufferUnlockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
         return;
@@ -224,6 +234,7 @@ static inline uint8_t clampByte(int v) {
         }
 
         [gLock unlock];
+        signalFrame();
 
         CVPixelBufferUnlockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
         return;
@@ -287,6 +298,7 @@ static inline uint8_t clampByte(int v) {
         }
 
         [gLock unlock];
+        signalFrame();
 
         CVPixelBufferUnlockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
         return;
@@ -303,6 +315,7 @@ static GoFrameDelegate *gDelegate;
 int StartCapture() {
     @autoreleasepool {
         gLock = [NSLock new];
+        gFrameSem = dispatch_semaphore_create(0);
 
         AVCaptureDevice *dev = [AVCaptureDevice defaultDeviceWithMediaType:AVMediaTypeVideo];
         if (!dev) return -1;
@@ -380,33 +393,40 @@ void StopCapture() {
         gDelegate = nil;
         gQueue = nil;
         gLock = nil;
+        gFrameSem = nil;
     }
 }
 
-// GetFrame: 0 ok, -1 no new frame
-int GetFrame(uint8_t **buf, int *w, int *h, int *frameSizeOut) {
-    if (!gFrameBuf || !gLock) {
-        return -1;
-    }
+// WaitFrame waits up to timeoutMs for a new frame: 0 signalled, -1 timeout.
+int WaitFrame(int timeoutMs) {
+    dispatch_semaphore_t sem = gFrameSem;
+    if (!sem) return -1;
+    long r = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)timeoutMs * NSEC_PER_MSEC));
+    return r == 0 ? 0 : -1;
+}
 
+// CopyFrame copies the newest unread frame into dst while holding the lock,
+// so the capture queue cannot overwrite it halfway through the copy.
+// Returns the byte count, -1 if there is no new frame, or -2 if dst is too
+// small (*w and *h then hold the frame size; the frame stays unread).
+int CopyFrame(uint8_t *dst, int capacity, int *w, int *h) {
+    if (!gLock) return -1;
     [gLock lock];
-
-    if (!gFrameReady) {
+    if (!gFrameReady || !gFrameBuf) {
         [gLock unlock];
         return -1;
     }
-
-    *buf = gFrameBuf;
+    int size = gFrameWidth * gFrameHeight * 3;
     *w = gFrameWidth;
     *h = gFrameHeight;
-    if (frameSizeOut) {
-        *frameSizeOut = gFrameWidth * gFrameHeight * 3;
+    if (!dst || capacity < size) {
+        [gLock unlock];
+        return -2;
     }
+    memcpy(dst, gFrameBuf, (size_t)size);
     gFrameReady = 0; // mark as consumed
-
     [gLock unlock];
-
-    return 0;
+    return size;
 }
 
 int GetFrameSize(int *w, int *h) {
@@ -438,7 +458,6 @@ import (
 	"log"
 	"os"
 	"sync/atomic"
-	"time"
 	"unsafe"
 )
 
@@ -518,7 +537,13 @@ func StartStream(ctx context.Context) (<-chan Frame, error) {
 		defer close(frames)
 		defer C.StopCapture()
 
-		const dropThreshold = 30
+		// waitTimeout bounds how long the loop waits for a frame before it
+		// checks ctx again; after dropThreshold empty waits (~330 ms) black
+		// frames stand in for the missing camera.
+		const (
+			waitTimeout   = 33
+			dropThreshold = 10
+		)
 		misses := 0
 
 		sendFrame := func(frame Frame) {
@@ -544,38 +569,19 @@ func StartStream(ctx context.Context) (<-chan Frame, error) {
 			return buf
 		}
 
-		sendBlack := func() bool {
+		sendBlack := func() {
 			var cw, ch C.int
-			if C.GetFrameSize(&cw, &ch) != 0 {
-				return false
+			if C.GetFrameSize(&cw, &ch) != 0 || cw <= 0 || ch <= 0 {
+				return
 			}
-			w := int(cw)
-			h := int(ch)
-			if w <= 0 || h <= 0 {
-				return false
-			}
-			data := makeBlack(w, h)
-			if data == nil {
-				return false
-			}
-			frame := Frame{
-				Data:   data,
-				Width:  w,
-				Height: h,
-			}
-			sendFrame(frame)
-			return true
-		}
-
-		handleDrop := func(longWait, shortWait time.Duration) {
-			misses++
-			if misses >= dropThreshold && sendBlack() {
-				time.Sleep(longWait)
-			} else {
-				time.Sleep(shortWait)
+			if data := makeBlack(int(cw), int(ch)); data != nil {
+				sendFrame(Frame{Data: data, Width: int(cw), Height: int(ch)})
 			}
 		}
 
+		// buf receives the next frame; it is handed to the consumer with
+		// the frame, so each frame gets its own.
+		var buf []byte
 		for {
 			select {
 			case <-ctx.Done():
@@ -583,36 +589,30 @@ func StartStream(ctx context.Context) (<-chan Frame, error) {
 			default:
 			}
 
-			var cbuf *C.uchar
+			if C.WaitFrame(waitTimeout) != 0 {
+				misses++
+				if misses >= dropThreshold {
+					sendBlack()
+				}
+				continue
+			}
+
 			var cw, ch C.int
-			var csize C.int
-
-			if C.GetFrame(&cbuf, &cw, &ch, &csize) != 0 {
-				handleDrop(33*time.Millisecond, 10*time.Millisecond)
-				continue
+			n := C.CopyFrame(bufPtr(buf), C.int(len(buf)), &cw, &ch)
+			if n == -2 {
+				// First frame or a new size: allocate and copy again.
+				if cw <= 0 || ch <= 0 {
+					continue
+				}
+				buf = make([]byte, int(cw)*int(ch)*3)
+				n = C.CopyFrame(bufPtr(buf), C.int(len(buf)), &cw, &ch)
+			}
+			if n <= 0 {
+				continue // the frame was already taken (an extra signal)
 			}
 
-			w := int(cw)
-			h := int(ch)
-			size := int(csize)
-			if w <= 0 || h <= 0 || size <= 0 || cbuf == nil {
-				handleDrop(33*time.Millisecond, 5*time.Millisecond)
-				continue
-			}
-
-			data := C.GoBytes(unsafe.Pointer(cbuf), C.int(size))
-
-			// C side already provides packed YCbCr 4:4:4 (3 bytes per pixel).
-			if len(data) != w*h*3 {
-				handleDrop(33*time.Millisecond, 5*time.Millisecond)
-				continue
-			}
-
-			frame := Frame{
-				Data:   data,
-				Width:  w,
-				Height: h,
-			}
+			frame := Frame{Data: buf[:int(n)], Width: int(cw), Height: int(ch)}
+			buf = make([]byte, len(buf))
 
 			logOnce()
 
@@ -622,4 +622,12 @@ func StartStream(ctx context.Context) (<-chan Frame, error) {
 	}()
 
 	return frames, nil
+}
+
+// bufPtr returns the address of buf's first byte, or nil when empty.
+func bufPtr(buf []byte) *C.uint8_t {
+	if len(buf) == 0 {
+		return nil
+	}
+	return (*C.uint8_t)(unsafe.Pointer(&buf[0]))
 }

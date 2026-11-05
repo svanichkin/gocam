@@ -6,36 +6,50 @@ package gocam
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
 )
 
+// V4L2 backend.
+//
+// Finding a camera: GOCAM_DEVICE (e.g. /dev/video2) if set, otherwise every
+// /dev/video* node in numeric order. Nodes that are not capture devices
+// (video decoders and encoders such as the PinePhone's Cedrus at
+// /dev/video0, metadata nodes) are skipped.
+//
+// Opening one: the formats the driver lists (VIDIOC_ENUM_FMT) are tried in
+// gocam's order of preference, first at CIF (352x288), then at the node's
+// current size. On SoC cameras (PinePhone, many ARM boards) the node is fed
+// by a media controller pipeline: if streaming does not start, gocam links a
+// sensor in (GOCAM_SENSOR picks one by name; the front camera is preferred),
+// matches the formats along the pipeline and tries again at the sensor's
+// size. A working camera is opened exactly as before; the extra steps only
+// run when the plain way fails.
+
 const (
-	v4l2BufTypeVideoCapture = 1
-	v4l2FieldAny            = 0
-	v4l2MemoryMMap          = 1
+	v4l2BufTypeVideoCapture       = 1
+	v4l2BufTypeVideoCaptureMPlane = 9
+	v4l2FieldAny                  = 0
+	v4l2MemoryMMap                = 1
 )
 
 const (
-	v4l2PixFmtRGB24 = 0x33424752 // 'RGB3'
-	v4l2PixFmtYUYV  = 0x56595559 // 'YUYV'
-	v4l2PixFmtNV12  = 0x3231564E // 'NV12'
-	v4l2PixFmtYUV24 = 0x33565559 // 'YUV3' (packed 4:4:4, 8 bits per component)
-)
-
-const (
-	v4l2CapVideoCapture = 0x00000001
-	v4l2CapStreaming    = 0x04000000
-	v4l2CapDeviceCaps   = 0x80000000
-)
-
-const (
-	cifWidth  = 352
-	cifHeight = 288
+	v4l2CapVideoCapture       = 0x00000001
+	v4l2CapVideoCaptureMPlane = 0x00001000
+	v4l2CapVideoM2MMPlane     = 0x00004000
+	v4l2CapVideoM2M           = 0x00008000
+	v4l2CapStreaming          = 0x04000000
+	v4l2CapDeviceCaps         = 0x80000000
 )
 
 type v4l2Capability struct {
@@ -63,10 +77,41 @@ type v4l2PixFormat struct {
 	XferFunc     uint32
 }
 
+type v4l2PlanePixFormat struct {
+	Sizeimage    uint32
+	Bytesperline uint32
+	Reserved     [6]uint16
+}
+
+type v4l2PixFormatMPlane struct {
+	Width        uint32
+	Height       uint32
+	Pixelformat  uint32
+	Field        uint32
+	Colorspace   uint32
+	PlaneFmt     [8]v4l2PlanePixFormat
+	NumPlanes    uint8
+	Flags        uint8
+	YcbcrEnc     uint8
+	Quantization uint8
+	XferFunc     uint8
+	Reserved     [7]uint8
+}
+
 type v4l2Format struct {
 	Type uint32
 	_    [4]byte // align union to 64-bit boundary like C's struct v4l2_format
 	fmt  [200]byte
+}
+
+type v4l2FmtDesc struct {
+	Index       uint32
+	Type        uint32
+	Flags       uint32
+	Description [32]byte
+	Pixelformat uint32
+	MbusCode    uint32
+	Reserved    [3]uint32
 }
 
 type v4l2RequestBuffers struct {
@@ -96,18 +141,26 @@ type v4l2Buffer struct {
 	Timecode  v4l2Timecode
 	Sequence  uint32
 	Memory    uint32
-	Offset    uint32
-	_         uint32 // union padding
+	M         uintptr // union: offset (single-planar) or planes pointer
 	Length    uint32
 	Reserved2 uint32
 	Reserved  uint32
+}
+
+// v4l2Plane is struct v4l2_plane (64 bytes); the m union sits at offset 8.
+type v4l2Plane struct {
+	Bytesused  uint32
+	Length     uint32
+	MemOffset  uint32
+	_          uint32
+	DataOffset uint32
+	Reserved   [11]uint32
 }
 
 const (
 	iocNRBits   = 8
 	iocTypeBits = 8
 	iocSizeBits = 14
-	iocDirBits  = 2
 
 	iocNRShift   = 0
 	iocTypeShift = iocNRShift + iocNRBits
@@ -125,24 +178,14 @@ func ioc(dir, typ, nr, size uintptr) uintptr {
 	return (dir << iocDirShift) | (typ << iocTypeShift) | (nr << iocNRShift) | (size << iocSizeShift)
 }
 
-func io(typ, nr uintptr) uintptr {
-	return ioc(iocNone, typ, nr, 0)
-}
-
-func iow(typ, nr, size uintptr) uintptr {
-	return ioc(iocWrite, typ, nr, size)
-}
-
-func ior(typ, nr, size uintptr) uintptr {
-	return ioc(iocRead, typ, nr, size)
-}
-
-func iowr(typ, nr, size uintptr) uintptr {
-	return ioc(iocRead|iocWrite, typ, nr, size)
-}
+func iow(typ, nr, size uintptr) uintptr  { return ioc(iocWrite, typ, nr, size) }
+func ior(typ, nr, size uintptr) uintptr  { return ioc(iocRead, typ, nr, size) }
+func iowr(typ, nr, size uintptr) uintptr { return ioc(iocRead|iocWrite, typ, nr, size) }
 
 var (
 	vidiocQuerycap  = ior(uintptr('V'), 0, unsafe.Sizeof(v4l2Capability{}))
+	vidiocEnumFmt   = iowr(uintptr('V'), 2, unsafe.Sizeof(v4l2FmtDesc{}))
+	vidiocGFmt      = iowr(uintptr('V'), 4, unsafe.Sizeof(v4l2Format{}))
 	vidiocSFmt      = iowr(uintptr('V'), 5, unsafe.Sizeof(v4l2Format{}))
 	vidiocReqbufs   = iowr(uintptr('V'), 8, unsafe.Sizeof(v4l2RequestBuffers{}))
 	vidiocQuerybuf  = iowr(uintptr('V'), 9, unsafe.Sizeof(v4l2Buffer{}))
@@ -152,295 +195,346 @@ var (
 	vidiocStreamOff = iow(uintptr('V'), 19, unsafe.Sizeof(uint32(0)))
 )
 
-type mappedBuffer struct {
-	data   []byte
-	length uint32
-}
-
 var camLog = log.New(os.Stdout, "", log.LstdFlags|log.Lmicroseconds)
 
 func v4l2CString(b []byte) string {
-	if len(b) == 0 {
-		return ""
-	}
 	if i := bytes.IndexByte(b, 0); i >= 0 {
 		b = b[:i]
 	}
 	return string(b)
 }
 
-// logCameraConfig prints a human-readable description of the current camera configuration.
-func logCameraConfig(caps *v4l2Capability, pixelFormat uint32, width, height, stride int) {
-	if width <= 0 || height <= 0 {
-		return
-	}
-
-	driver := v4l2CString(caps.Driver[:])
-	card := v4l2CString(caps.Card[:])
-	bus := v4l2CString(caps.BusInfo[:])
-
-	formatIn := "UNKNOWN"
-	switch pixelFormat {
-	case v4l2PixFmtYUV24:
-		formatIn = "YUV24 (YCbCr 4:4:4)"
-	case v4l2PixFmtNV12:
-		formatIn = "NV12 (YCbCr 4:2:0)"
-	case v4l2PixFmtYUYV:
-		formatIn = "YUYV (YCbCr 4:2:2)"
-	case v4l2PixFmtRGB24:
-		formatIn = "RGB24"
-	}
-
-	bufPixels := width * height
-	bufBytes := bufPixels * 3
-
-	camLog.Println("[gocam] [V4L2]")
-	camLog.Printf("[gocam]   /dev/video0 (Capture)\n")
-	if card != "" || driver != "" || bus != "" {
-		camLog.Printf("[gocam]     Card:       %s\n", card)
-		camLog.Printf("[gocam]     Driver:     %s\n", driver)
-		camLog.Printf("[gocam]     Bus:        %s\n", bus)
-	}
-	camLog.Printf("[gocam]     Format:      %s -> YCbCr 4:4:4 (uint8)\n", formatIn)
-	camLog.Printf("[gocam]     Resolution:  %d x %d\n", width, height)
-	camLog.Printf("[gocam]     Stride:      %d bytes\n", stride)
-	camLog.Printf("[gocam]     Buffer:      %d*3 (%d bytes)\n", bufPixels, bufBytes)
-	camLog.Println("[gocam]     Conversion:")
-	camLog.Println("[gocam]       Pre Format Conversion:  NO (device native)")
-	camLog.Println("[gocam]       Post Format Conversion: YES (to packed YCbCr444)")
-	camLog.Println("[gocam]       Resampling:             NO")
+// v4l2Stream is an open, streaming capture node.
+type v4l2Stream struct {
+	path    string
+	fd      int
+	caps    v4l2Capability
+	bufType uint32
+	pixFmt  uint32
+	width   int
+	height  int
+	stride  int
+	buffers [][]byte
+	planes  *v4l2Plane // scratch plane for multi-planar dequeues
 }
 
-// StartStream opens /dev/video0, configures a V4L2 capture stream, and
-// returns a channel of frames encoded as tightly packed YCbCr 4:4:4 (YUV24) buffers.
+// StartStream finds a camera, configures a V4L2 capture stream, and returns
+// a channel of frames encoded as tightly packed YCbCr 4:4:4 buffers.
 func StartStream(ctx context.Context) (<-chan Frame, error) {
-	fd, err := syscall.Open("/dev/video0", syscall.O_RDWR|syscall.O_NONBLOCK, 0)
+	paths := candidateDevices()
+	if len(paths) == 0 {
+		return nil, errors.New("gocam: no /dev/video* devices (is a camera driver loaded?)")
+	}
+	var failures []string
+	for _, path := range paths {
+		s, err := openStream(path)
+		if err != nil {
+			camLog.Printf("[gocam] %s: %v", path, err)
+			failures = append(failures, fmt.Sprintf("%s: %v", path, err))
+			continue
+		}
+		s.logConfig()
+		return s.run(ctx), nil
+	}
+	return nil, fmt.Errorf("gocam: no usable camera (%s)", strings.Join(failures, "; "))
+}
+
+// candidateDevices lists GOCAM_DEVICE alone if set, otherwise every
+// /dev/videoN in numeric order.
+func candidateDevices() []string {
+	if dev := strings.TrimSpace(os.Getenv("GOCAM_DEVICE")); dev != "" {
+		return []string{dev}
+	}
+	paths, _ := filepath.Glob("/dev/video*")
+	num := func(p string) int {
+		n, err := strconv.Atoi(strings.TrimPrefix(p, "/dev/video"))
+		if err != nil {
+			return 1 << 30
+		}
+		return n
+	}
+	sort.Slice(paths, func(i, j int) bool { return num(paths[i]) < num(paths[j]) })
+	return paths
+}
+
+func openStream(path string) (*v4l2Stream, error) {
+	fd, err := syscall.Open(path, syscall.O_RDWR|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 	if err != nil {
-		return nil, fmt.Errorf("gocam: cannot open /dev/video0: %w", err)
+		if errors.Is(err, syscall.EACCES) {
+			return nil, fmt.Errorf("cannot open: %w (is the user in the 'video' group?)", err)
+		}
+		return nil, fmt.Errorf("cannot open: %w", err)
+	}
+	s := &v4l2Stream{path: path, fd: fd}
+
+	if err := ioctl(fd, vidiocQuerycap, unsafe.Pointer(&s.caps)); err != nil {
+		s.close()
+		return nil, fmt.Errorf("VIDIOC_QUERYCAP: %w", err)
+	}
+	caps := s.caps.Capabilities
+	if caps&v4l2CapDeviceCaps != 0 {
+		caps = s.caps.DeviceCaps
+	}
+	card := v4l2CString(s.caps.Card[:])
+	switch {
+	case caps&(v4l2CapVideoM2M|v4l2CapVideoM2MMPlane) != 0:
+		s.close()
+		return nil, fmt.Errorf("%q is a memory-to-memory device (codec), not a camera", card)
+	case caps&v4l2CapVideoCapture != 0:
+		s.bufType = v4l2BufTypeVideoCapture
+	case caps&v4l2CapVideoCaptureMPlane != 0:
+		s.bufType = v4l2BufTypeVideoCaptureMPlane
+	default:
+		s.close()
+		return nil, fmt.Errorf("%q does not capture video", card)
+	}
+	if caps&v4l2CapStreaming == 0 {
+		s.close()
+		return nil, fmt.Errorf("%q does not support streaming I/O", card)
 	}
 
-	var (
-		buffers       []mappedBuffer
-		streamStarted bool
-	)
+	formats := s.listFormats()
+	curW, curH := s.currentSize()
 
-	cleanup := func() {
-		if streamStarted {
-			bufType := uint32(v4l2BufTypeVideoCapture)
-			_ = ioctl(fd, vidiocStreamOff, unsafe.Pointer(&bufType))
+	// Plain attempts: CIF, then the node's own size.
+	sizes := [][2]int{{cifWidth, cifHeight}}
+	if curW > 0 && curH > 0 && (curW != cifWidth || curH != cifHeight) {
+		sizes = append(sizes, [2]int{curW, curH})
+	}
+	var lastErr error
+	for _, sz := range sizes {
+		if lastErr = s.tryStart(formats, sz[0], sz[1]); lastErr == nil {
+			return s, nil
 		}
-		for _, mb := range buffers {
-			if mb.data != nil {
-				_ = syscall.Munmap(mb.data)
+	}
+
+	// A media controller pipeline (SoC camera): link a sensor in, match the
+	// formats and try at the sensor's size.
+	if w, h, sensorFormats, err := setupMediaPipeline(fd); err != nil {
+		camLog.Printf("[gocam] %s: media pipeline: %v", path, err)
+	} else {
+		try := sensorFormats
+		for _, f := range formats {
+			if !containsFmt(try, f) {
+				try = append(try, f)
 			}
 		}
-		_ = syscall.Close(fd)
-	}
-
-	var caps v4l2Capability
-	if err := ioctl(fd, vidiocQuerycap, unsafe.Pointer(&caps)); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("gocam: VIDIOC_QUERYCAP failed: %w", err)
-	}
-
-	capsToCheck := caps.Capabilities
-	if capsToCheck&v4l2CapDeviceCaps != 0 {
-		capsToCheck = caps.DeviceCaps
-	}
-	if capsToCheck&v4l2CapVideoCapture == 0 {
-		cleanup()
-		return nil, fmt.Errorf("gocam: device does not support video capture")
-	}
-	if capsToCheck&v4l2CapStreaming == 0 {
-		cleanup()
-		return nil, fmt.Errorf("gocam: device does not support streaming I/O")
-	}
-
-	const (
-		defaultWidth  = cifWidth
-		defaultHeight = cifHeight
-	)
-
-	width := uint32(defaultWidth)
-	height := uint32(defaultHeight)
-
-	pixelFormat := uint32(v4l2PixFmtYUV24)
-
-	format := v4l2Format{Type: v4l2BufTypeVideoCapture}
-	pix := (*v4l2PixFormat)(unsafe.Pointer(&format.fmt[0]))
-	pix.Width = width
-	pix.Height = height
-	pix.Pixelformat = pixelFormat
-	pix.Field = v4l2FieldAny
-
-	if err := ioctl(fd, vidiocSFmt, unsafe.Pointer(&format)); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("gocam: VIDIOC_S_FMT YUV24 failed: %w", err)
-	}
-
-	pixelFormat = pix.Pixelformat
-	width = pix.Width
-	height = pix.Height
-	stride := int(pix.Bytesperline)
-
-	if pixelFormat != v4l2PixFmtYUV24 {
-		// Fallback to NV12
-		pixelFormat = v4l2PixFmtNV12
-
-		format = v4l2Format{Type: v4l2BufTypeVideoCapture}
-		pix = (*v4l2PixFormat)(unsafe.Pointer(&format.fmt[0]))
-		pix.Width = width
-		pix.Height = height
-		pix.Pixelformat = pixelFormat
-		pix.Field = v4l2FieldAny
-
-		if err := ioctl(fd, vidiocSFmt, unsafe.Pointer(&format)); err != nil {
-			cleanup()
-			return nil, fmt.Errorf("gocam: VIDIOC_S_FMT fallback NV12 failed: %w", err)
-		}
-
-		pixelFormat = pix.Pixelformat
-		width = pix.Width
-		height = pix.Height
-		stride = int(pix.Bytesperline)
-
-		if pixelFormat != v4l2PixFmtNV12 {
-			// Fallback to YUYV
-			pixelFormat = v4l2PixFmtYUYV
-
-			format = v4l2Format{Type: v4l2BufTypeVideoCapture}
-			pix = (*v4l2PixFormat)(unsafe.Pointer(&format.fmt[0]))
-			pix.Width = width
-			pix.Height = height
-			pix.Pixelformat = pixelFormat
-			pix.Field = v4l2FieldAny
-
-			if err := ioctl(fd, vidiocSFmt, unsafe.Pointer(&format)); err != nil {
-				cleanup()
-				return nil, fmt.Errorf("gocam: VIDIOC_S_FMT fallback YUYV failed: %w", err)
-			}
-
-			pixelFormat = pix.Pixelformat
-			width = pix.Width
-			height = pix.Height
-			stride = int(pix.Bytesperline)
-
-			if pixelFormat != v4l2PixFmtYUYV {
-				// Final fallback to RGB24
-				pixelFormat = v4l2PixFmtRGB24
-
-				format = v4l2Format{Type: v4l2BufTypeVideoCapture}
-				pix = (*v4l2PixFormat)(unsafe.Pointer(&format.fmt[0]))
-				pix.Width = width
-				pix.Height = height
-				pix.Pixelformat = pixelFormat
-				pix.Field = v4l2FieldAny
-
-				if err := ioctl(fd, vidiocSFmt, unsafe.Pointer(&format)); err != nil {
-					cleanup()
-					return nil, fmt.Errorf("gocam: VIDIOC_S_FMT fallback RGB24 failed: %w", err)
-				}
-
-				pixelFormat = pix.Pixelformat
-				width = pix.Width
-				height = pix.Height
-				stride = int(pix.Bytesperline)
-				if pixelFormat != v4l2PixFmtRGB24 {
-					cleanup()
-					return nil, fmt.Errorf("gocam: unsupported pixel format 0x%x", pixelFormat)
-				}
-			}
+		if lastErr = s.tryStart(try, w, h); lastErr == nil {
+			return s, nil
 		}
 	}
+	s.close()
+	return nil, lastErr
+}
 
-	if stride == 0 {
-		switch pixelFormat {
-		case v4l2PixFmtRGB24:
-			stride = int(width) * 3
-		case v4l2PixFmtYUYV:
-			stride = int(width) * 2
-		case v4l2PixFmtNV12:
-			stride = int(width)
-		case v4l2PixFmtYUV24:
-			stride = int(width) * 3
+// listFormats returns the driver's formats that gocam can convert, in
+// gocam's order of preference; all of them if the driver lists none.
+func (s *v4l2Stream) listFormats() []uint32 {
+	var listed []uint32
+	for i := uint32(0); i < 64; i++ {
+		d := v4l2FmtDesc{Index: i, Type: s.bufType}
+		if ioctl(s.fd, vidiocEnumFmt, unsafe.Pointer(&d)) != nil {
+			break
+		}
+		listed = append(listed, d.Pixelformat)
+	}
+	if len(listed) == 0 {
+		return append([]uint32(nil), preferredPixFormats...)
+	}
+	var out []uint32
+	for _, f := range preferredPixFormats {
+		if containsFmt(listed, f) {
+			out = append(out, f)
 		}
 	}
-
-	req := v4l2RequestBuffers{
-		Count:  4,
-		Type:   v4l2BufTypeVideoCapture,
-		Memory: v4l2MemoryMMap,
+	if len(out) == 0 {
+		names := make([]string, len(listed))
+		for i, f := range listed {
+			names[i] = pixFmtName(f)
+		}
+		camLog.Printf("[gocam] %s offers only %s, which gocam cannot convert", s.path, strings.Join(names, ", "))
 	}
-	if err := ioctl(fd, vidiocReqbufs, unsafe.Pointer(&req)); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("gocam: VIDIOC_REQBUFS failed: %w", err)
+	return out
+}
+
+func containsFmt(list []uint32, f uint32) bool {
+	for _, x := range list {
+		if x == f {
+			return true
+		}
+	}
+	return false
+}
+
+// currentSize is the node's configured size (0 if unknown).
+func (s *v4l2Stream) currentSize() (int, int) {
+	f := v4l2Format{Type: s.bufType}
+	if ioctl(s.fd, vidiocGFmt, unsafe.Pointer(&f)) != nil {
+		return 0, 0
+	}
+	if s.bufType == v4l2BufTypeVideoCaptureMPlane {
+		mp := (*v4l2PixFormatMPlane)(unsafe.Pointer(&f.fmt[0]))
+		return int(mp.Width), int(mp.Height)
+	}
+	pix := (*v4l2PixFormat)(unsafe.Pointer(&f.fmt[0]))
+	return int(pix.Width), int(pix.Height)
+}
+
+// tryStart sets the first format the driver accepts at about w x h and
+// starts streaming; it tries the next format if streaming is refused.
+func (s *v4l2Stream) tryStart(formats []uint32, w, h int) error {
+	if len(formats) == 0 {
+		return errors.New("no convertible pixel format")
+	}
+	var lastErr error
+	for _, pf := range formats {
+		if err := s.setFormat(pf, w, h); err != nil {
+			lastErr = err
+			continue
+		}
+		if err := s.startStreaming(); err != nil {
+			lastErr = fmt.Errorf("%s %dx%d: %w", pixFmtName(s.pixFmt), s.width, s.height, err)
+			s.stopStreaming()
+			continue
+		}
+		return nil
+	}
+	return lastErr
+}
+
+// setFormat asks for pf at w x h; the driver may adjust the size, but a
+// different pixel format is refused.
+func (s *v4l2Stream) setFormat(pf uint32, w, h int) error {
+	f := v4l2Format{Type: s.bufType}
+	if s.bufType == v4l2BufTypeVideoCaptureMPlane {
+		mp := (*v4l2PixFormatMPlane)(unsafe.Pointer(&f.fmt[0]))
+		mp.Width, mp.Height, mp.Pixelformat, mp.Field, mp.NumPlanes = uint32(w), uint32(h), pf, v4l2FieldAny, 1
+		if err := ioctl(s.fd, vidiocSFmt, unsafe.Pointer(&f)); err != nil {
+			return fmt.Errorf("VIDIOC_S_FMT %s: %w", pixFmtName(pf), err)
+		}
+		if mp.Pixelformat != pf {
+			return fmt.Errorf("driver gave %s instead of %s", pixFmtName(mp.Pixelformat), pixFmtName(pf))
+		}
+		if mp.NumPlanes != 1 {
+			return fmt.Errorf("%s uses %d planes; gocam reads one", pixFmtName(pf), mp.NumPlanes)
+		}
+		s.pixFmt, s.width, s.height, s.stride = pf, int(mp.Width), int(mp.Height), int(mp.PlaneFmt[0].Bytesperline)
+	} else {
+		pix := (*v4l2PixFormat)(unsafe.Pointer(&f.fmt[0]))
+		pix.Width, pix.Height, pix.Pixelformat, pix.Field = uint32(w), uint32(h), pf, v4l2FieldAny
+		if err := ioctl(s.fd, vidiocSFmt, unsafe.Pointer(&f)); err != nil {
+			return fmt.Errorf("VIDIOC_S_FMT %s: %w", pixFmtName(pf), err)
+		}
+		if pix.Pixelformat != pf {
+			return fmt.Errorf("driver gave %s instead of %s", pixFmtName(pix.Pixelformat), pixFmtName(pf))
+		}
+		s.pixFmt, s.width, s.height, s.stride = pf, int(pix.Width), int(pix.Height), int(pix.Bytesperline)
+	}
+	if s.width <= 0 || s.height <= 0 {
+		return fmt.Errorf("invalid frame size %dx%d", s.width, s.height)
+	}
+	if s.stride < bytesPerLine(s.pixFmt, s.width) {
+		s.stride = bytesPerLine(s.pixFmt, s.width)
+	}
+	return nil
+}
+
+func (s *v4l2Stream) newBuffer(index uint32) *v4l2Buffer {
+	b := &v4l2Buffer{Type: s.bufType, Memory: v4l2MemoryMMap, Index: index}
+	if s.bufType == v4l2BufTypeVideoCaptureMPlane {
+		if s.planes == nil {
+			s.planes = new(v4l2Plane)
+		}
+		*s.planes = v4l2Plane{}
+		b.M = uintptr(unsafe.Pointer(s.planes))
+		b.Length = 1
+	}
+	return b
+}
+
+// startStreaming maps four buffers, queues them and starts the stream.
+func (s *v4l2Stream) startStreaming() error {
+	req := v4l2RequestBuffers{Count: 4, Type: s.bufType, Memory: v4l2MemoryMMap}
+	if err := ioctl(s.fd, vidiocReqbufs, unsafe.Pointer(&req)); err != nil {
+		return fmt.Errorf("VIDIOC_REQBUFS: %w", err)
 	}
 	if req.Count < 2 {
-		cleanup()
-		return nil, fmt.Errorf("gocam: insufficient buffers: %d", req.Count)
+		return fmt.Errorf("insufficient buffers: %d", req.Count)
 	}
-
-	buffers = make([]mappedBuffer, req.Count)
-
 	for i := uint32(0); i < req.Count; i++ {
-		buf := v4l2Buffer{
-			Type:   v4l2BufTypeVideoCapture,
-			Memory: v4l2MemoryMMap,
-			Index:  i,
-		}
-		if err := ioctl(fd, vidiocQuerybuf, unsafe.Pointer(&buf)); err != nil {
-			cleanup()
-			return nil, fmt.Errorf("gocam: VIDIOC_QUERYBUF index %d failed: %w", i, err)
-		}
-
-		data, err := syscall.Mmap(fd, int64(buf.Offset), int(buf.Length), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+		b := s.newBuffer(i)
+		err := ioctl(s.fd, vidiocQuerybuf, unsafe.Pointer(b))
+		runtime.KeepAlive(s.planes)
 		if err != nil {
-			cleanup()
-			return nil, fmt.Errorf("gocam: mmap buffer %d failed: %w", i, err)
+			return fmt.Errorf("VIDIOC_QUERYBUF %d: %w", i, err)
 		}
-
-		buffers[i] = mappedBuffer{data: data, length: buf.Length}
-
-		if err := ioctl(fd, vidiocQBuf, unsafe.Pointer(&buf)); err != nil {
-			cleanup()
-			return nil, fmt.Errorf("gocam: VIDIOC_QBUF index %d failed: %w", i, err)
+		offset, length := uint32(b.M), b.Length
+		if s.bufType == v4l2BufTypeVideoCaptureMPlane {
+			offset, length = s.planes.MemOffset, s.planes.Length
+		}
+		data, err := syscall.Mmap(s.fd, int64(offset), int(length), syscall.PROT_READ|syscall.PROT_WRITE, syscall.MAP_SHARED)
+		if err != nil {
+			return fmt.Errorf("mmap buffer %d: %w", i, err)
+		}
+		s.buffers = append(s.buffers, data)
+		b = s.newBuffer(i)
+		err = ioctl(s.fd, vidiocQBuf, unsafe.Pointer(b))
+		runtime.KeepAlive(s.planes)
+		if err != nil {
+			return fmt.Errorf("VIDIOC_QBUF %d: %w", i, err)
 		}
 	}
-
-	bufType := uint32(v4l2BufTypeVideoCapture)
-	if err := ioctl(fd, vidiocStreamOn, unsafe.Pointer(&bufType)); err != nil {
-		cleanup()
-		return nil, fmt.Errorf("gocam: VIDIOC_STREAMON failed: %w", err)
+	bufType := s.bufType
+	if err := ioctl(s.fd, vidiocStreamOn, unsafe.Pointer(&bufType)); err != nil {
+		if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ENOLINK) {
+			return fmt.Errorf("VIDIOC_STREAMON: %w (the camera pipeline is not linked or its formats do not match)", err)
+		}
+		return fmt.Errorf("VIDIOC_STREAMON: %w", err)
 	}
-	streamStarted = true
+	return nil
+}
 
-	frameW := int(width)
-	frameH := int(height)
-	if frameW <= 0 || frameH <= 0 {
-		cleanup()
-		return nil, fmt.Errorf("gocam: invalid frame size %dx%d", frameW, frameH)
+// stopStreaming stops the stream and releases the buffers, so the format can
+// be changed and streaming tried again.
+func (s *v4l2Stream) stopStreaming() {
+	bufType := s.bufType
+	_ = ioctl(s.fd, vidiocStreamOff, unsafe.Pointer(&bufType))
+	for _, b := range s.buffers {
+		_ = syscall.Munmap(b)
 	}
+	s.buffers = nil
+	req := v4l2RequestBuffers{Count: 0, Type: s.bufType, Memory: v4l2MemoryMMap}
+	_ = ioctl(s.fd, vidiocReqbufs, unsafe.Pointer(&req))
+}
 
-	// Logical output size:
-	// - If the source is larger than CIF in at least one dimension, we downsample to CIF.
-	// - Otherwise, keep the native size (no upscaling).
-	outW := frameW
-	outH := frameH
-	if frameW > cifWidth || frameH > cifHeight {
-		outW = cifWidth
-		outH = cifHeight
+func (s *v4l2Stream) close() {
+	if s.buffers != nil {
+		s.stopStreaming()
 	}
+	_ = syscall.Close(s.fd)
+}
 
-	logCameraConfig(&caps, pixelFormat, outW, outH, stride)
+func (s *v4l2Stream) logConfig() {
+	outW, outH := outputSize(s.width, s.height)
+	planar := ""
+	if s.bufType == v4l2BufTypeVideoCaptureMPlane {
+		planar = " (multi-planar API)"
+	}
+	camLog.Println("[gocam] [V4L2]")
+	camLog.Printf("[gocam]   %s (Capture)%s\n", s.path, planar)
+	camLog.Printf("[gocam]     Card:        %s\n", v4l2CString(s.caps.Card[:]))
+	camLog.Printf("[gocam]     Driver:      %s\n", v4l2CString(s.caps.Driver[:]))
+	camLog.Printf("[gocam]     Bus:         %s\n", v4l2CString(s.caps.BusInfo[:]))
+	camLog.Printf("[gocam]     Format:      %s %dx%d (stride %d) -> YCbCr 4:4:4 %dx%d\n",
+		pixFmtName(s.pixFmt), s.width, s.height, s.stride, outW, outH)
+}
 
+// run reads frames until ctx is done; it owns and finally closes s.
+func (s *v4l2Stream) run(ctx context.Context) <-chan Frame {
 	frames := make(chan Frame, 1)
-
 	go func() {
 		defer close(frames)
-		defer cleanup()
-
-		const dropThreshold = 30
-		misses := 0
+		defer s.close()
 
 		sendFrame := func(frame Frame) {
 			select {
@@ -451,46 +545,22 @@ func StartStream(ctx context.Context) (<-chan Frame, error) {
 			}
 		}
 
-		makeBlack := func() []byte {
-			size := outW * outH * 3
-			if size <= 0 {
-				return nil
+		outW, outH := outputSize(s.width, s.height)
+		black := func() Frame {
+			buf := make([]byte, outW*outH*3)
+			for i := 0; i < len(buf); i += 3 {
+				buf[i], buf[i+1], buf[i+2] = 16, 128, 128
 			}
-			buf := make([]byte, size)
-			for i := 0; i < size; i += 3 {
-				buf[i] = 16
-				buf[i+1] = 128
-				buf[i+2] = 128
-			}
-			return buf
+			return Frame{Data: buf, Width: outW, Height: outH}
 		}
 
-		sendBlack := func() bool {
-			if outW <= 0 || outH <= 0 {
-				return false
-			}
-			data := makeBlack()
-			if data == nil {
-				return false
-			}
-			frame := Frame{
-				Data:   data,
-				Width:  outW,
-				Height: outH,
-			}
-			sendFrame(frame)
-			return true
-		}
-
-		handleDrop := func(longWait, shortWait time.Duration) {
-			misses++
-			if misses >= dropThreshold && sendBlack() {
-				time.Sleep(longWait)
-			} else {
-				time.Sleep(shortWait)
-			}
-		}
-
+		// Wait for frames with ppoll (100 ms steps, to notice ctx); after
+		// about 300 ms without one, black frames stand in for the camera.
+		const (
+			waitStep      = 100 * time.Millisecond
+			dropThreshold = 3
+		)
+		misses := 0
 		for {
 			select {
 			case <-ctx.Done():
@@ -498,400 +568,97 @@ func StartStream(ctx context.Context) (<-chan Frame, error) {
 			default:
 			}
 
-			buf := v4l2Buffer{
-				Type:   v4l2BufTypeVideoCapture,
-				Memory: v4l2MemoryMMap,
+			ready, err := waitReadable(s.fd, waitStep)
+			if err != nil {
+				camLog.Printf("[gocam] %s: poll: %v", s.path, err)
+				return
+			}
+			if !ready {
+				misses++
+				if misses >= dropThreshold {
+					sendFrame(black())
+				}
+				continue
 			}
 
-			if err := ioctl(fd, vidiocDQBuf, unsafe.Pointer(&buf)); err != nil {
-				if errno, ok := err.(syscall.Errno); ok && (errno == syscall.EAGAIN || errno == syscall.EINTR) {
-					time.Sleep(5 * time.Millisecond)
+			b := s.newBuffer(0)
+			err = ioctl(s.fd, vidiocDQBuf, unsafe.Pointer(b))
+			runtime.KeepAlive(s.planes)
+			if err != nil {
+				if errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EINTR) {
 					continue
 				}
-				handleDrop(33*time.Millisecond, 10*time.Millisecond)
+				camLog.Printf("[gocam] %s: VIDIOC_DQBUF: %v", s.path, err)
+				misses++
+				time.Sleep(10 * time.Millisecond)
 				continue
 			}
 
-			index := buf.Index
-			if int(index) >= len(buffers) {
-				_ = ioctl(fd, vidiocQBuf, unsafe.Pointer(&buf))
-				continue
+			index := b.Index
+			used, offset := int(b.Bytesused), 0
+			if s.bufType == v4l2BufTypeVideoCaptureMPlane {
+				used, offset = int(s.planes.Bytesused), int(s.planes.DataOffset)
+			}
+			var data []byte
+			if int(index) < len(s.buffers) {
+				buf := s.buffers[index]
+				if used <= 0 || used > len(buf) {
+					used = len(buf)
+				}
+				if offset < used {
+					data, outW, outH = sampleYCbCr444(buf[offset:used], s.pixFmt, s.width, s.height, s.stride)
+				}
 			}
 
-			data := buffers[index].data
-			sz := int(buf.Bytesused)
-			if sz <= 0 || sz > len(data) {
-				sz = len(data)
-			}
-			src := data[:sz]
-
-			frameData := convertFrame(src, pixelFormat, frameW, frameH, stride)
-
-			if err := ioctl(fd, vidiocQBuf, unsafe.Pointer(&buf)); err != nil {
+			b = s.newBuffer(index)
+			err = ioctl(s.fd, vidiocQBuf, unsafe.Pointer(b))
+			runtime.KeepAlive(s.planes)
+			if err != nil {
+				camLog.Printf("[gocam] %s: VIDIOC_QBUF: %v", s.path, err)
 				return
 			}
 
-			if frameData == nil {
-				handleDrop(33*time.Millisecond, 5*time.Millisecond)
+			if data == nil {
+				misses++
 				continue
 			}
-
-			// Downsample with aspect-ratio-preserving center crop if needed.
-			dataOut := frameData
-			w := frameW
-			h := frameH
-			if frameW > cifWidth || frameH > cifHeight {
-				resampled := resampleYCbCr444Fill(frameData, frameW, frameH, cifWidth, cifHeight)
-				if resampled == nil {
-					handleDrop(33*time.Millisecond, 5*time.Millisecond)
-					continue
-				}
-				dataOut = resampled
-				w = cifWidth
-				h = cifHeight
-			}
-
-			frame := Frame{
-				Data:   dataOut,
-				Width:  w,
-				Height: h,
-			}
-
 			misses = 0
-			sendFrame(frame)
+			sendFrame(Frame{Data: data, Width: outW, Height: outH})
 		}
 	}()
-
-	return frames, nil
+	return frames
 }
 
-// convertFrame normalizes a single captured frame from various V4L2 pixel
-// formats into a tightly packed YCbCr 4:4:4 buffer (packed Y, Cb, Cr per pixel).
-func convertFrame(src []byte, pixFmt uint32, width, height, stride int) []byte {
-	if width <= 0 || height <= 0 {
-		return nil
+// waitReadable waits until fd has a frame or timeout passes.
+func waitReadable(fd int, timeout time.Duration) (bool, error) {
+	pfd := struct {
+		fd      int32
+		events  int16
+		revents int16
+	}{fd: int32(fd), events: 0x1 /* POLLIN */}
+	ts := syscall.NsecToTimespec(int64(timeout))
+	n, _, errno := syscall.Syscall6(syscall.SYS_PPOLL, uintptr(unsafe.Pointer(&pfd)), 1, uintptr(unsafe.Pointer(&ts)), 0, 0, 0)
+	if errno != 0 {
+		if errno == syscall.EINTR {
+			return false, nil
+		}
+		return false, errno
 	}
-
-	// All output frames are packed YCbCr 4:4:4: 3 bytes per pixel.
-	dstSize := width * height * 3
-	if dstSize <= 0 {
-		return nil
+	if pfd.revents&(0x8|0x20) != 0 { // POLLERR, POLLNVAL
+		return false, fmt.Errorf("device error (revents 0x%x)", pfd.revents)
 	}
-	dst := make([]byte, dstSize)
-
-	switch pixFmt {
-	case v4l2PixFmtYUV24:
-		// Source is already packed YUV444 (Y, Cb, Cr) but may have stride.
-		rowBytes := width * 3
-		if rowBytes <= 0 || len(src) < rowBytes {
-			return nil
-		}
-
-		effectiveStride := stride
-		if effectiveStride <= 0 {
-			effectiveStride = rowBytes
-		}
-		if height > 0 && effectiveStride*height > len(src) {
-			effectiveStride = len(src) / height
-			if effectiveStride < rowBytes {
-				return nil
-			}
-		}
-
-		for y := 0; y < height; y++ {
-			inStart := y * effectiveStride
-			inEnd := inStart + rowBytes
-			if inEnd > len(src) {
-				return nil
-			}
-			row := src[inStart:inEnd]
-
-			for x := 0; x < width; x++ {
-				si := x * 3
-				di := (y*width + x) * 3
-				if si+2 >= len(row) || di+2 >= len(dst) {
-					break
-				}
-				dst[di] = row[si]     // Y
-				dst[di+1] = row[si+1] // Cb
-				dst[di+2] = row[si+2] // Cr
-			}
-		}
-
-	case v4l2PixFmtNV12:
-		// NV12: Y plane (full res), then interleaved CbCr at 2x2 subsampling.
-		rowBytesY := width
-		if rowBytesY <= 0 || len(src) < rowBytesY {
-			return nil
-		}
-
-		effectiveStride := stride
-		if effectiveStride <= 0 {
-			effectiveStride = rowBytesY
-		}
-
-		totalLines := height + height/2
-		if effectiveStride*totalLines > len(src) {
-			effectiveStride = len(src) / totalLines
-			if effectiveStride < rowBytesY {
-				return nil
-			}
-		}
-
-		yPlaneSize := effectiveStride * height
-		if yPlaneSize > len(src) {
-			return nil
-		}
-
-		yPlane := src[:yPlaneSize]
-		uvPlane := src[yPlaneSize:]
-
-		for y := 0; y < height; y++ {
-			for x := 0; x < width; x++ {
-				// Luma from Y plane.
-				yIdx := y*effectiveStride + x
-				if yIdx >= len(yPlane) {
-					return nil
-				}
-				Y := yPlane[yIdx]
-
-				// Chroma from UV plane: 2x2 block.
-				uvY := y / 2
-				uvX := x / 2
-				uvIdx := uvY*effectiveStride + uvX*2
-				if uvIdx+1 >= len(uvPlane) {
-					return nil
-				}
-				Cb := uvPlane[uvIdx]
-				Cr := uvPlane[uvIdx+1]
-
-				di := (y*width + x) * 3
-				if di+2 >= len(dst) {
-					return nil
-				}
-				dst[di] = Y
-				dst[di+1] = Cb
-				dst[di+2] = Cr
-			}
-		}
-
-	case v4l2PixFmtYUYV:
-		// YUYV 4:2:2: Y0 U Y1 V for each pair of pixels.
-		rowBytes := width * 2
-		if rowBytes <= 0 || len(src) < rowBytes {
-			return nil
-		}
-
-		effectiveStride := stride
-		if effectiveStride <= 0 {
-			effectiveStride = rowBytes
-		}
-		if height > 0 && effectiveStride*height > len(src) {
-			effectiveStride = len(src) / height
-			if effectiveStride < rowBytes {
-				return nil
-			}
-		}
-
-		for y := 0; y < height; y++ {
-			inStart := y * effectiveStride
-			inEnd := inStart + rowBytes
-			if inEnd > len(src) {
-				return nil
-			}
-			row := src[inStart:inEnd]
-
-			for x := 0; x < width; x += 2 {
-				si := x * 2
-				if si+3 >= len(row) {
-					break
-				}
-
-				Y0 := row[si]
-				U := row[si+1]
-				Y1 := row[si+2]
-				V := row[si+3]
-
-				// First pixel
-				di0 := (y*width + x) * 3
-				if di0+2 < len(dst) {
-					dst[di0] = Y0
-					dst[di0+1] = U
-					dst[di0+2] = V
-				}
-
-				// Second pixel (shares U,V)
-				if x+1 < width {
-					di1 := (y*width + x + 1) * 3
-					if di1+2 < len(dst) {
-						dst[di1] = Y1
-						dst[di1+1] = U
-						dst[di1+2] = V
-					}
-				}
-			}
-		}
-
-	case v4l2PixFmtRGB24:
-		// RGB24 -> YCbCr444
-		rowBytes := width * 3
-		if rowBytes <= 0 || len(src) < rowBytes {
-			return nil
-		}
-
-		effectiveStride := stride
-		if effectiveStride <= 0 {
-			effectiveStride = rowBytes
-		}
-		if height > 0 && effectiveStride*height > len(src) {
-			effectiveStride = len(src) / height
-			if effectiveStride < rowBytes {
-				return nil
-			}
-		}
-
-		for y := 0; y < height; y++ {
-			inStart := y * effectiveStride
-			inEnd := inStart + rowBytes
-			if inEnd > len(src) {
-				return nil
-			}
-			row := src[inStart:inEnd]
-
-			for x := 0; x < width; x++ {
-				si := x * 3
-				if si+2 >= len(row) {
-					break
-				}
-
-				R := int(row[si])
-				G := int(row[si+1])
-				B := int(row[si+2])
-
-				Y := (66*R+129*G+25*B+128)>>8 + 16
-				Cb := (-38*R-74*G+112*B+128)>>8 + 128
-				Cr := (112*R-94*G-18*B+128)>>8 + 128
-
-				di := (y*width + x) * 3
-				if di+2 >= len(dst) {
-					return nil
-				}
-				dst[di] = clampToByte(Y)
-				dst[di+1] = clampToByte(Cb)
-				dst[di+2] = clampToByte(Cr)
-			}
-		}
-
-	default:
-		return nil
-	}
-
-	return dst
-}
-
-// resampleYCbCr444Fill downsamples a packed YCbCr444 buffer into dstW x dstH,
-// preserving aspect ratio with a centered crop ("fill"). If the source is
-// already smaller than or equal to dst in both dimensions, it returns the
-// original buffer (no upscaling).
-func resampleYCbCr444Fill(src []byte, srcW, srcH, dstW, dstH int) []byte {
-	if srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0 {
-		return nil
-	}
-	if len(src) < srcW*srcH*3 {
-		return nil
-	}
-
-	// No upscaling: if source fits entirely within dst, keep it as-is.
-	if srcW <= dstW && srcH <= dstH {
-		return src
-	}
-
-	dst := make([]byte, dstW*dstH*3)
-
-	// Compute centered crop region in source.
-	srcAspect := float64(srcW) / float64(srcH)
-	dstAspect := float64(dstW) / float64(dstH)
-
-	cropW := srcW
-	cropH := srcH
-	srcX0 := 0
-	srcY0 := 0
-
-	if srcAspect > dstAspect {
-		// Source is wider than destination: crop left/right.
-		cropH = srcH
-		cropW = int(float64(srcH) * dstAspect)
-		if cropW > srcW {
-			cropW = srcW
-		}
-		if cropW < 1 {
-			cropW = 1
-		}
-		srcX0 = (srcW - cropW) / 2
-		srcY0 = 0
-	} else {
-		// Source is taller than destination: crop top/bottom.
-		cropW = srcW
-		cropH = int(float64(srcW) / dstAspect)
-		if cropH > srcH {
-			cropH = srcH
-		}
-		if cropH < 1 {
-			cropH = 1
-		}
-		srcX0 = 0
-		srcY0 = (srcH - cropH) / 2
-	}
-
-	for dy := 0; dy < dstH; dy++ {
-		syRel := 0
-		if dstH > 0 {
-			syRel = dy * cropH / dstH
-		}
-		sy := srcY0 + syRel
-		if sy >= srcH {
-			sy = srcH - 1
-		}
-
-		for dx := 0; dx < dstW; dx++ {
-			sxRel := 0
-			if dstW > 0 {
-				sxRel = dx * cropW / dstW
-			}
-			sx := srcX0 + sxRel
-			if sx >= srcW {
-				sx = srcW - 1
-			}
-
-			srcIndex := (sy*srcW + sx) * 3
-			dstIndex := (dy*dstW + dx) * 3
-			if srcIndex+2 >= len(src) || dstIndex+2 >= len(dst) {
-				continue
-			}
-
-			dst[dstIndex] = src[srcIndex]
-			dst[dstIndex+1] = src[srcIndex+1]
-			dst[dstIndex+2] = src[srcIndex+2]
-		}
-	}
-
-	return dst
-}
-
-func clampToByte(v int) byte {
-	if v < 0 {
-		return 0
-	}
-	if v > 255 {
-		return 255
-	}
-	return byte(v)
+	return n > 0, nil
 }
 
 func ioctl(fd int, req uintptr, arg unsafe.Pointer) error {
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), req, uintptr(arg))
-	if errno != 0 {
-		return errno
+	for {
+		_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), req, uintptr(arg))
+		if errno == syscall.EINTR {
+			continue
+		}
+		if errno != 0 {
+			return errno
+		}
+		return nil
 	}
-	return nil
 }
