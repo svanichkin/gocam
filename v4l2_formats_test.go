@@ -361,6 +361,17 @@ func pack(img []byte, w, h int, f uint32) []byte {
 		for x := 0; x < w; x++ {
 			Y, cb, cr := px(x, y)
 			switch f {
+			case pixFmtYU12, pixFmtYV12:
+				out[y*stride+x] = Y
+				if x%2 == 0 && y%2 == 0 {
+					cs := stride / 2
+					u := stride*h + (y/2)*cs + x/2
+					v := stride*h + cs*((h+1)/2) + (y/2)*cs + x/2
+					if f == pixFmtYV12 {
+						u, v = v, u
+					}
+					out[u], out[v] = cb, cr
+				}
 			case pixFmtNV12, pixFmtNV21:
 				out[y*stride+x] = Y
 				if x%2 == 0 && y%2 == 0 {
@@ -411,7 +422,7 @@ func TestSampleNewFormats(t *testing.T) {
 			}
 		}
 		want, ww, wh := sampleYCbCr444(img, pixFmtYUV24, w, h, w*3)
-		for _, f := range []uint32{pixFmtNV12, pixFmtNV21, pixFmtYUYV, pixFmtUYVY, pixFmtYVYU, pixFmtVYUY} {
+		for _, f := range []uint32{pixFmtNV12, pixFmtNV21, pixFmtYU12, pixFmtYV12, pixFmtYUYV, pixFmtUYVY, pixFmtYVYU, pixFmtVYUY} {
 			got, gw, gh := sampleYCbCr444(pack(img, w, h, f), f, w, h, bytesPerLine(f, w))
 			if gw != ww || gh != wh || !bytes.Equal(got, want) {
 				t.Fatalf("%s %dx%d differs from the 4:4:4 source", pixFmtName(f), w, h)

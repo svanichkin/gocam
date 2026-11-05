@@ -13,6 +13,8 @@ var (
 	pixFmtYUV24 = fourcc('Y', 'U', 'V', '3') // packed 4:4:4
 	pixFmtNV12  = fourcc('N', 'V', '1', '2') // Y plane, then CbCr 2x2
 	pixFmtNV21  = fourcc('N', 'V', '2', '1') // Y plane, then CrCb 2x2
+	pixFmtYU12  = fourcc('Y', 'U', '1', '2') // I420: Y, Cb, Cr planes (ffmpeg's yuv420p, v4l2loopback)
+	pixFmtYV12  = fourcc('Y', 'V', '1', '2') // Y, Cr, Cb planes
 	pixFmtYUYV  = fourcc('Y', 'U', 'Y', 'V') // 4:2:2 Y0 Cb Y1 Cr
 	pixFmtUYVY  = fourcc('U', 'Y', 'V', 'Y') // 4:2:2 Cb Y0 Cr Y1 (PinePhone sensors)
 	pixFmtYVYU  = fourcc('Y', 'V', 'Y', 'U') // 4:2:2 Y0 Cr Y1 Cb
@@ -22,7 +24,7 @@ var (
 )
 
 var preferredPixFormats = []uint32{
-	pixFmtYUV24, pixFmtNV12, pixFmtNV21, pixFmtYUYV, pixFmtUYVY, pixFmtYVYU, pixFmtVYUY, pixFmtRGB24, pixFmtBGR24,
+	pixFmtYUV24, pixFmtNV12, pixFmtNV21, pixFmtYU12, pixFmtYV12, pixFmtYUYV, pixFmtUYVY, pixFmtYVYU, pixFmtVYUY, pixFmtRGB24, pixFmtBGR24,
 }
 
 func pixFmtName(f uint32) string {
@@ -42,7 +44,7 @@ func bytesPerLine(f uint32, width int) int {
 		return width * 3
 	case pixFmtYUYV, pixFmtUYVY, pixFmtYVYU, pixFmtVYUY:
 		return width * 2
-	case pixFmtNV12, pixFmtNV21:
+	case pixFmtNV12, pixFmtNV21, pixFmtYU12, pixFmtYV12:
 		return width
 	}
 	return 0
@@ -53,6 +55,9 @@ func frameBytes(f uint32, stride, height int) int {
 	switch f {
 	case pixFmtNV12, pixFmtNV21:
 		return stride * (height + (height+1)/2)
+	case pixFmtYU12, pixFmtYV12:
+		// Two chroma planes of half the stride and half the rows.
+		return stride*height + 2*(stride/2)*((height+1)/2)
 	}
 	return stride * height
 }
@@ -181,6 +186,17 @@ func sampleYCbCr444(src []byte, f uint32, w, h, stride int) ([]byte, int, int) {
 			for _, sx := range cols {
 				u := (sx / 2) * 2
 				dst[di], dst[di+1], dst[di+2] = row[sx], uv[u+cb], uv[u+cr]
+				di += 3
+			}
+		case pixFmtYU12, pixFmtYV12:
+			cs := stride / 2
+			uRow := src[stride*h+(sy/2)*cs:]
+			vRow := src[stride*h+cs*((h+1)/2)+(sy/2)*cs:]
+			if f == pixFmtYV12 {
+				uRow, vRow = vRow, uRow
+			}
+			for _, sx := range cols {
+				dst[di], dst[di+1], dst[di+2] = row[sx], uRow[sx/2], vRow[sx/2]
 				di += 3
 			}
 		case pixFmtYUYV, pixFmtUYVY, pixFmtYVYU, pixFmtVYUY:

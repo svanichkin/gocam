@@ -126,8 +126,8 @@ From here you can:
 
 - Uses **V4L2** directly via syscalls, no cgo.
 - Finding the camera: every `/dev/video*` node is tried in numeric order; nodes that are not capture devices (video decoders/encoders such as the PinePhone's Cedrus at `/dev/video0`, metadata nodes) are skipped. Set `GOCAM_DEVICE=/dev/video2` to use one node only.
-- Pixel formats: YUV24, NV12, NV21, YUYV, UYVY, YVYU, VYUY, RGB24 and BGR24, chosen among the ones the driver lists, in this order. Single- and multi-planar capture nodes (one plane) are supported. The frame is cropped and scaled to CIF in one pass while it is converted.
-- Size: CIF (352×288) first, then the node's current size if the driver refuses to stream at CIF.
+- Pixel formats: YUV24, NV12, NV21, YU12 (I420), YV12, YUYV, UYVY, YVYU, VYUY, RGB24 and BGR24, chosen among the ones the driver lists, in this order. Single- and multi-planar capture nodes (one plane) are supported. The frame is cropped and scaled to CIF in one pass while it is converted.
+- Size: CIF (352×288) first, then the node's current size if the driver refuses to stream at CIF; then the node's current format as it is, without setting one (a `v4l2loopback` device takes the format its producer chose and refuses others).
 - SoC cameras with a media controller (PinePhone, many ARM boards): if the node still does not stream, gocam does what `media-ctl` would: it links a sensor to the capture node, sets the same format on every pad along the pipeline and tries again at the sensor's size. The front camera is preferred (the PinePhone's GC2145); `GOCAM_SENSOR=ov5640` picks a sensor by name. The topology and every step are logged.
   - Sensors that only output raw Bayer need an ISP (PinePhone Pro, many phones); gocam reports this instead of streaming.
 - Requirements:

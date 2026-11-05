@@ -29,7 +29,8 @@ import (
 //
 // Opening one: the formats the driver lists (VIDIOC_ENUM_FMT) are tried in
 // gocam's order of preference, first at CIF (352x288), then at the node's
-// current size. On SoC cameras (PinePhone, many ARM boards) the node is fed
+// current size; then the node's current format as it is (v4l2loopback
+// devices, whose format their producer sets). On SoC cameras (PinePhone, many ARM boards) the node is fed
 // by a media controller pipeline: if streaming does not start, gocam links a
 // sensor in (GOCAM_SENSOR picks one by name; the front camera is preferred),
 // matches the formats along the pipeline and tries again at the sensor's
@@ -308,6 +309,14 @@ func openStream(path string) (*v4l2Stream, error) {
 		}
 	}
 
+	// The node as it is: a v4l2loopback device fed by another program
+	// refuses VIDIOC_S_FMT; its format is the one the producer chose.
+	if err := s.startAsIs(); err == nil {
+		return s, nil
+	} else {
+		camLog.Printf("[gocam] %s: current format: %v", path, err)
+	}
+
 	// A media controller pipeline (SoC camera): link a sensor in, match the
 	// formats and try at the sensor's size.
 	if w, h, sensorFormats, err := setupMediaPipeline(fd); err != nil {
@@ -378,6 +387,38 @@ func (s *v4l2Stream) currentSize() (int, int) {
 	}
 	pix := (*v4l2PixFormat)(unsafe.Pointer(&f.fmt[0]))
 	return int(pix.Width), int(pix.Height)
+}
+
+// startAsIs streams in the node's current format, without setting one.
+func (s *v4l2Stream) startAsIs() error {
+	f := v4l2Format{Type: s.bufType}
+	if err := ioctl(s.fd, vidiocGFmt, unsafe.Pointer(&f)); err != nil {
+		return fmt.Errorf("VIDIOC_G_FMT: %w", err)
+	}
+	if s.bufType == v4l2BufTypeVideoCaptureMPlane {
+		mp := (*v4l2PixFormatMPlane)(unsafe.Pointer(&f.fmt[0]))
+		if mp.NumPlanes != 1 {
+			return fmt.Errorf("%s uses %d planes; gocam reads one", pixFmtName(mp.Pixelformat), mp.NumPlanes)
+		}
+		s.pixFmt, s.width, s.height, s.stride = mp.Pixelformat, int(mp.Width), int(mp.Height), int(mp.PlaneFmt[0].Bytesperline)
+	} else {
+		pix := (*v4l2PixFormat)(unsafe.Pointer(&f.fmt[0]))
+		s.pixFmt, s.width, s.height, s.stride = pix.Pixelformat, int(pix.Width), int(pix.Height), int(pix.Bytesperline)
+	}
+	if !containsFmt(preferredPixFormats, s.pixFmt) {
+		return fmt.Errorf("%s %dx%d, which gocam cannot convert", pixFmtName(s.pixFmt), s.width, s.height)
+	}
+	if s.width <= 0 || s.height <= 0 {
+		return fmt.Errorf("invalid frame size %dx%d", s.width, s.height)
+	}
+	if s.stride < bytesPerLine(s.pixFmt, s.width) {
+		s.stride = bytesPerLine(s.pixFmt, s.width)
+	}
+	if err := s.startStreaming(); err != nil {
+		s.stopStreaming()
+		return fmt.Errorf("%s %dx%d: %w", pixFmtName(s.pixFmt), s.width, s.height, err)
+	}
+	return nil
 }
 
 // tryStart sets the first format the driver accepts at about w x h and
