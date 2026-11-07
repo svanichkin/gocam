@@ -7,6 +7,7 @@ Cross-platform camera capture for Go with a tiny, unified API.
 - **macOS**: AVFoundation (via cgo + Objective‑C)
 - **Linux**: V4L2 (`/dev/video*`)
 - **Windows**: Media Foundation
+- **Plan 9 (9front)**: nusb/cam (`/dev/cam*/video`, YUY2 cameras), pure Go
 
 You get the same Go API everywhere:
 
