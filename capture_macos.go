@@ -22,6 +22,9 @@ static uint8_t *gFrameBuf;
 static int gFrameWidth;
 static int gFrameHeight;
 static int gFrameReady;
+// gFrameHostTime: when the stored frame was captured, in seconds of the
+// host time clock (-1: unknown).
+static double gFrameHostTime = -1;
 static NSLock *gLock;
 // gFrameSem is signalled for every new frame, so the Go side waits for
 // frames instead of polling.
@@ -49,6 +52,21 @@ static inline uint8_t clampByte(int v) {
 {
     CVImageBufferRef img = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (!img) return;
+
+    // When the camera captured the frame: its presentation time, on the
+    // session's clock, converted to the host time clock.
+    double hostTime = -1;
+    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+    if (CMTIME_IS_NUMERIC(pts)) {
+        CMClockRef clock = NULL;
+        AVCaptureSession *session = gSession;
+        if (@available(macOS 12.3, *)) {
+            clock = session.synchronizationClock;
+        }
+        CMClockRef host = CMClockGetHostTimeClock();
+        CMTime t = clock ? CMSyncConvertTime(pts, clock, host) : pts;
+        if (CMTIME_IS_NUMERIC(t)) hostTime = CMTimeGetSeconds(t);
+    }
 
     CVPixelBufferLockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
 
@@ -162,6 +180,7 @@ static inline uint8_t clampByte(int v) {
             }
 
             gFrameReady = 1;
+            gFrameHostTime = hostTime;
         }
 
         [gLock unlock];
@@ -231,6 +250,7 @@ static inline uint8_t clampByte(int v) {
             }
 
             gFrameReady = 1;
+            gFrameHostTime = hostTime;
         }
 
         [gLock unlock];
@@ -295,6 +315,7 @@ static inline uint8_t clampByte(int v) {
             }
 
             gFrameReady = 1;
+            gFrameHostTime = hostTime;
         }
 
         [gLock unlock];
@@ -409,7 +430,8 @@ int WaitFrame(int timeoutMs) {
 // so the capture queue cannot overwrite it halfway through the copy.
 // Returns the byte count, -1 if there is no new frame, or -2 if dst is too
 // small (*w and *h then hold the frame size; the frame stays unread).
-int CopyFrame(uint8_t *dst, int capacity, int *w, int *h) {
+// *age is how long ago the camera captured it, in seconds (-1: unknown).
+int CopyFrame(uint8_t *dst, int capacity, int *w, int *h, double *age) {
     if (!gLock) return -1;
     [gLock lock];
     if (!gFrameReady || !gFrameBuf) {
@@ -425,6 +447,10 @@ int CopyFrame(uint8_t *dst, int capacity, int *w, int *h) {
     }
     memcpy(dst, gFrameBuf, (size_t)size);
     gFrameReady = 0; // mark as consumed
+    *age = -1;
+    if (gFrameHostTime >= 0) {
+        *age = CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock())) - gFrameHostTime;
+    }
     [gLock unlock];
     return size;
 }
@@ -458,6 +484,7 @@ import (
 	"log"
 	"os"
 	"sync/atomic"
+	"time"
 	"unsafe"
 )
 
@@ -598,20 +625,24 @@ func StartStream(ctx context.Context) (<-chan Frame, error) {
 			}
 
 			var cw, ch C.int
-			n := C.CopyFrame(bufPtr(buf), C.int(len(buf)), &cw, &ch)
+			var age C.double
+			n := C.CopyFrame(bufPtr(buf), C.int(len(buf)), &cw, &ch, &age)
 			if n == -2 {
 				// First frame or a new size: allocate and copy again.
 				if cw <= 0 || ch <= 0 {
 					continue
 				}
 				buf = make([]byte, int(cw)*int(ch)*3)
-				n = C.CopyFrame(bufPtr(buf), C.int(len(buf)), &cw, &ch)
+				n = C.CopyFrame(bufPtr(buf), C.int(len(buf)), &cw, &ch, &age)
 			}
 			if n <= 0 {
 				continue // the frame was already taken (an extra signal)
 			}
 
 			frame := Frame{Data: buf[:int(n)], Width: int(cw), Height: int(ch)}
+			if a := float64(age); a >= 0 && a < 1 {
+				frame.CapturedAt = time.Now().Add(-time.Duration(a * float64(time.Second)))
+			}
 			buf = make([]byte, len(buf))
 
 			logOnce()
